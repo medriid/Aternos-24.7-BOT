@@ -63,16 +63,62 @@ let reconnectTimer = null;
 let connectTimer = null;
 let manualStop = false;
 
+// UI state. `phase` is one of: offline, connecting, authenticating, online.
+let phase = 'offline';
+let phaseMessage = 'Bot is offline.';
+let onlineSince = null;
+const logLines = [];
+
+function pushLog(line) {
+  logLines.push({ at: Date.now(), line });
+  if (logLines.length > 60) logLines.shift();
+  io.emit('bot_log', logLines[logLines.length - 1]);
+}
+
+function setPhase(next, message) {
+  phase = next;
+  phaseMessage = message;
+  if (next === 'online' && !onlineSince) onlineSince = Date.now();
+  if (next !== 'online') onlineSince = null;
+  io.emit('bot_status', message);
+  broadcastState();
+}
+
+function currentState() {
+  return {
+    phase,
+    message: phaseMessage,
+    username: botUsername,
+    host: serverHost,
+    port: serverPort,
+    health: bot && typeof bot.health === 'number' ? Math.round(bot.health * 10) / 10 : null,
+    food: bot && typeof bot.food === 'number' ? Math.round(bot.food) : null,
+    position:
+      bot && bot.entity && bot.entity.position
+        ? {
+            x: Math.round(bot.entity.position.x * 10) / 10,
+            y: Math.round(bot.entity.position.y * 10) / 10,
+            z: Math.round(bot.entity.position.z * 10) / 10,
+          }
+        : null,
+    playersOnline: bot && bot.players ? Object.keys(bot.players).length : null,
+    uptimeMs: onlineSince ? Date.now() - onlineSince : 0,
+    antiAfkSeconds: Math.round(antiAfkInterval / 1000),
+  };
+}
+
+function broadcastState() {
+  io.emit('bot_state', currentState());
+}
+
+setInterval(broadcastState, 1000);
+
 io.on('connection', (socket) => {
   console.log('Web client connected.');
 
-  if (bot && bot.player) {
-    socket.emit('bot_status', `Bot ${bot.username} is online.`);
-  } else if (bot) {
-    socket.emit('bot_status', 'Bot is connecting...');
-  } else {
-    socket.emit('bot_status', 'Bot is offline.');
-  }
+  socket.emit('bot_status', phaseMessage);
+  socket.emit('bot_state', currentState());
+  socket.emit('bot_log_history', logLines);
 
   socket.on('control_bot', (command) => {
     switch (command) {
@@ -113,7 +159,8 @@ function createBot() {
   }
 
   console.log(`Connecting bot "${botUsername}" to ${serverHost}:${serverPort} ...`);
-  io.emit('bot_status', `Connecting to ${serverHost}:${serverPort}...`);
+  setPhase('connecting', `Connecting to ${serverHost}:${serverPort}...`);
+  pushLog(`Connecting to ${serverHost}:${serverPort}`);
 
   let newBot;
   try {
@@ -124,10 +171,18 @@ function createBot() {
       version: minecraftVersion,
       auth: authMode,
       hideErrors: false,
+      plugins: {
+        // Minecraft 26.x replaced update_time's `time` field with a
+        // clockUpdates array. mineflayer's time plugin still reads
+        // packet.time and crashes on undefined. The bot does not need
+        // time tracking, so disable it.
+        time: false,
+      },
     });
   } catch (err) {
     console.error('Failed to create bot:', err.message);
-    io.emit('bot_status', `Failed to create bot: ${err.message}`);
+    setPhase('offline', `Failed to create bot: ${err.message}`);
+    pushLog(`Failed to create bot: ${err.message}`);
     scheduleReconnect();
     return;
   }
@@ -137,15 +192,26 @@ function createBot() {
 
   bot.once('login', () => {
     console.log(`Bot "${bot.username}" logged in to ${serverHost}.`);
-    io.emit('bot_status', `Bot ${bot.username} logged in.`);
+    setPhase('authenticating', `Logged in as ${bot.username}. Authenticating...`);
+    pushLog(`Logged in as ${bot.username}`);
+    // Login plugins freeze unauthenticated players and withhold update_health,
+    // which is what mineflayer waits on to emit 'spawn'. So authenticate here
+    // rather than on 'spawn', or the two would deadlock.
+    sendLoginCommands();
   });
 
   bot.once('spawn', () => {
     clearConnectTimer();
     console.log(`Bot "${bot.username}" spawned in the world.`);
-    io.emit('bot_status', `Bot ${bot.username} spawned. Anti-AFK active.`);
-    sendLoginCommands();
+    setPhase('online', `${bot.username} is online. Anti-AFK active.`);
+    pushLog('Spawned in world; anti-AFK active');
     startAntiAfk();
+  });
+
+  // Server chat, including login-plugin replies ("You are now authenticated").
+  bot.on('messagestr', (message) => {
+    console.log(`[chat] ${message}`);
+    pushLog(message);
   });
 
   bot.on('health', () => {
@@ -156,6 +222,7 @@ function createBot() {
 
   bot.on('death', () => {
     console.log('Bot died. Respawning.');
+    pushLog('Bot died; respawning');
     io.emit('bot_status', 'Bot died, respawning.');
   });
 
@@ -168,6 +235,7 @@ function createBot() {
       // Reason was not JSON; use as-is.
     }
     console.log(`Bot kicked: ${message}`);
+    pushLog(`Kicked: ${message}`);
     io.emit('bot_status', `Kicked: ${message}`);
   });
 
@@ -198,13 +266,17 @@ function handleDisconnect(reason) {
 
   console.log(`Bot disconnected. Reason: ${reason || 'unknown'}.`);
   cleanupBot();
+  pushLog(`Disconnected: ${reason || 'unknown'}`);
 
   if (manualStop) {
-    io.emit('bot_status', 'Bot stopped.');
+    setPhase('offline', 'Bot stopped.');
     return;
   }
 
-  io.emit('bot_status', `Disconnected (${reason || 'unknown'}). Reconnecting in ${reconnectInterval / 1000}s.`);
+  setPhase(
+    'connecting',
+    `Disconnected (${reason || 'unknown'}). Reconnecting in ${reconnectInterval / 1000}s.`
+  );
   scheduleReconnect();
 }
 
@@ -310,9 +382,10 @@ function stopBot(message) {
     }
     cleanupBot();
     console.log(message || 'Bot stopped.');
-    io.emit('bot_status', message || 'Bot stopped.');
+    setPhase('offline', message || 'Bot stopped.');
+    pushLog(message || 'Bot stopped');
   } else {
-    io.emit('bot_status', 'Bot is not running.');
+    setPhase('offline', 'Bot is not running.');
   }
 }
 

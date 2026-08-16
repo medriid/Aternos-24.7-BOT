@@ -1,0 +1,10 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "aternos-bot",
+      "url": "http://localhost:3070",
+      "port": 3070
+    }
+  ]
+}
