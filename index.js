@@ -1,16 +1,42 @@
+// Load .env without pulling in a dependency (Node >= 20.12).
+try {
+  process.loadEnvFile();
+} catch (err) {
+  // No .env file, or an older Node. Fall back to real environment variables.
+}
+
 const express = require('express');
 const path = require('path');
 const http = require('http');
 const { Server } = require('socket.io');
+
+// Must run before mineflayer is required: adds Minecraft 26.2 support that
+// mineflayer and minecraft-data have not shipped yet. See mcdata-shim.js.
+const shimResult = require('./mcdata-shim')();
+console.log('26.2 shim:', JSON.stringify(shimResult));
+
 const mineflayer = require('mineflayer');
 
-const serverHost = process.env.SERVER_HOST || 'DOOMS_DAY_REBORN.aternos.me';
-const serverPort = parseInt(process.env.SERVER_PORT || '59173', 10);
-const botUsername = process.env.BOT_USERNAME || '247_Monitor';
+const serverHost = process.env.SERVER_HOST || 'larpsofvellore.aternos.me';
+const serverPort = parseInt(process.env.SERVER_PORT || '30677', 10);
+const botUsername = process.env.BOT_USERNAME || 'LarpUptime';
 const minecraftVersion = process.env.MC_VERSION || false;
+// 'offline' for cracked servers, 'microsoft' for online-mode servers.
+const authMode = process.env.AUTH_MODE || 'offline';
 const reconnectInterval = parseInt(process.env.RECONNECT_INTERVAL_MS || '40000', 10);
 const antiAfkInterval = parseInt(process.env.ANTI_AFK_INTERVAL_MS || '20000', 10);
 const httpPort = parseInt(process.env.PORT || '3000', 10);
+
+// Login-plugin support (EasyAuth, AuthMe, ...). Leave AUTH_PASSWORD unset to
+// disable. %p is replaced with the password.
+const authPassword = process.env.AUTH_PASSWORD || '';
+const registerCommand = process.env.REGISTER_COMMAND || '/register %p %p';
+const loginCommand = process.env.LOGIN_COMMAND || '/login %p';
+const loginDelay = parseInt(process.env.LOGIN_DELAY_MS || '2000', 10);
+// Give up on a connection that never reaches 'spawn'. Aternos accepts the TCP
+// connection even when the server behind it is stopped or crashed, and in that
+// case mineflayer emits nothing at all, so only a timeout can recover.
+const connectTimeout = parseInt(process.env.CONNECT_TIMEOUT_MS || '60000', 10);
 
 const app = express();
 const server = http.createServer(app);
@@ -34,6 +60,7 @@ app.get('/health', (req, res) => {
 let bot = null;
 let antiAfkTimer = null;
 let reconnectTimer = null;
+let connectTimer = null;
 let manualStop = false;
 
 io.on('connection', (socket) => {
@@ -95,7 +122,7 @@ function createBot() {
       port: serverPort,
       username: botUsername,
       version: minecraftVersion,
-      auth: 'offline',
+      auth: authMode,
       hideErrors: false,
     });
   } catch (err) {
@@ -106,6 +133,7 @@ function createBot() {
   }
 
   bot = newBot;
+  startConnectWatchdog(newBot);
 
   bot.once('login', () => {
     console.log(`Bot "${bot.username}" logged in to ${serverHost}.`);
@@ -113,8 +141,10 @@ function createBot() {
   });
 
   bot.once('spawn', () => {
+    clearConnectTimer();
     console.log(`Bot "${bot.username}" spawned in the world.`);
     io.emit('bot_status', `Bot ${bot.username} spawned. Anti-AFK active.`);
+    sendLoginCommands();
     startAntiAfk();
   });
 
@@ -142,20 +172,83 @@ function createBot() {
   });
 
   bot.on('error', (err) => {
-    console.error('Bot error:', err && err.message ? err.message : err);
-    io.emit('bot_status', `Error: ${err && err.message ? err.message : err}`);
+    const message = err && err.message ? err.message : String(err);
+    console.error('Bot error:', message);
+    io.emit('bot_status', `Error: ${message}`);
+
+    // Errors thrown before the connection is established (bad version, DNS
+    // failure, refused socket) never produce an 'end' event, so without this
+    // the bot would sit dead forever and never retry. Give 'end' a moment to
+    // arrive on its own; handleDisconnect is idempotent either way.
+    const erroredBot = bot;
+    setTimeout(() => {
+      if (bot === erroredBot) handleDisconnect(`error: ${message}`);
+    }, 1000);
   });
 
   bot.on('end', (reason) => {
-    console.log(`Bot disconnected. Reason: ${reason || 'unknown'}.`);
-    cleanupBot();
-    if (manualStop) {
-      io.emit('bot_status', 'Bot stopped.');
-      return;
-    }
-    io.emit('bot_status', `Disconnected (${reason || 'unknown'}). Reconnecting in ${reconnectInterval / 1000}s.`);
-    scheduleReconnect();
+    handleDisconnect(reason);
   });
+}
+
+// Tears down the current bot and schedules a reconnect. Safe to call more than
+// once for the same connection; only the first call has any effect.
+function handleDisconnect(reason) {
+  if (!bot) return;
+
+  console.log(`Bot disconnected. Reason: ${reason || 'unknown'}.`);
+  cleanupBot();
+
+  if (manualStop) {
+    io.emit('bot_status', 'Bot stopped.');
+    return;
+  }
+
+  io.emit('bot_status', `Disconnected (${reason || 'unknown'}). Reconnecting in ${reconnectInterval / 1000}s.`);
+  scheduleReconnect();
+}
+
+function startConnectWatchdog(pendingBot) {
+  clearConnectTimer();
+  connectTimer = setTimeout(() => {
+    connectTimer = null;
+    if (bot !== pendingBot) return;
+    console.log(`No spawn within ${connectTimeout / 1000}s; server is probably stopped or crashed.`);
+    try {
+      bot.end('connect timeout');
+    } catch (_) {
+      // Socket may already be gone.
+    }
+    handleDisconnect('connect timeout (server stopped or crashed?)');
+  }, connectTimeout);
+}
+
+function clearConnectTimer() {
+  if (connectTimer) {
+    clearTimeout(connectTimer);
+    connectTimer = null;
+  }
+}
+
+function sendLoginCommands() {
+  if (!authPassword) return;
+
+  const send = (template, delay) => {
+    setTimeout(() => {
+      if (!bot) return;
+      try {
+        bot.chat(template.replace(/%p/g, authPassword));
+      } catch (err) {
+        console.error('Login command failed:', err.message);
+      }
+    }, delay);
+  };
+
+  // Register first so a fresh bot account works; login plugins simply reply
+  // "already registered" when the account exists. Never log the password.
+  console.log('Sending login-plugin credentials.');
+  send(registerCommand, loginDelay);
+  send(loginCommand, loginDelay + 1500);
 }
 
 function startAntiAfk() {
@@ -200,6 +293,7 @@ function stopAntiAfk() {
 
 function cleanupBot() {
   stopAntiAfk();
+  clearConnectTimer();
   if (bot) {
     bot.removeAllListeners();
   }
